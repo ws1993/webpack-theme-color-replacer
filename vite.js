@@ -1,0 +1,285 @@
+'use strict';
+
+var path = require('path');
+var fs = require('fs');
+var Extractor = require('./src/Extractor');
+var replaceFileName = require('./src/replaceFileName');
+var varyColor = require('./client/varyColor');
+
+var CSS_EXT_RE = /\.(css|scss|sass|less|styl|stylus)$/i;
+var HASH_PLACEHOLDER_RE = /[-.]?\[(?:contenthash|hash)(?::\d+)?\]/gi;
+var LINE_RE = /\n/g;
+
+function normalizePath(p) {
+    return String(p).replace(/\\/g, '/');
+}
+
+function splitId(id) {
+    var q = id.indexOf('?');
+    return q > -1 ? [id.slice(0, q), id.slice(q)] : [id, ''];
+}
+
+function dropDuplicate(arr) {
+    var map = {};
+    var r = [];
+    for (var i = 0; i < arr.length; i++) {
+        var s = arr[i];
+        if (!map[s]) {
+            r.push(s);
+            map[s] = 1;
+        }
+    }
+    return r;
+}
+
+// Vite `?inline` 的 transform 结果通常是 `export default "<css>"`，也可能直接是 css 文本。
+function cssFromTransformResult(code) {
+    if (typeof code !== 'string') return '';
+    var m = /^\s*export\s+default\s+("[\s\S]*")\s*;?\s*$/.exec(code);
+    if (m) {
+        try { return JSON.parse(m[1]); } catch (e) { /* fallthrough */ }
+    }
+    if (!/^\s*(import|export|const|let|var|function|class)\b/.test(code)) {
+        return code;
+    }
+    return '';
+}
+
+module.exports = function viteThemeColorReplacer(options) {
+    options = options || {};
+    var opts = Object.assign({
+        fileName: 'h5/css/theme-colors.[contenthash:8].css',
+        matchColors: [],
+        configVar: null,
+        injectCss: false,
+        injectToHtml: false,
+        externalCssFiles: null,
+        resolveCss: null,
+        changeSelector: null,
+        include: null,
+        exclude: null,
+    }, options);
+
+    var include = toRegExp(opts.include) || CSS_EXT_RE;
+    var exclude = toRegExp(opts.exclude);
+    var extractor = new Extractor(opts);
+
+    var configVar = opts.configVar;
+    var isDev = false;
+    var server = null;
+    var root = null;
+
+    // dev 状态
+    var cssModules = new Set();
+    var timer = null;
+    var devFileName = null;
+    var devFile = null;
+
+    // build 状态（供 injectToHtml 的 transformIndexHtml 读取）
+    var buildOutFile = null;
+    var buildOutput = null;
+
+    function toRegExp(v) {
+        if (!v) return null;
+        return v instanceof RegExp ? v : new RegExp(v);
+    }
+
+    function isCssModule(id) {
+        var base = splitId(id)[0];
+        if (exclude && exclude.test(base)) return false;
+        return include.test(base);
+    }
+
+    function devFileNameFor() {
+        return String(opts.fileName).replace(HASH_PLACEHOLDER_RE, '');
+    }
+
+    function devFileFor() {
+        var name = devFileNameFor();
+        var publicDir = server && server.config.publicDir;
+        if (publicDir) {
+            return path.join(publicDir, name);
+        }
+        return path.join(root || process.cwd(), name);
+    }
+
+    function toViteUrl(id) {
+        var base = splitId(id)[0];
+        var rel = normalizePath(path.relative(root || process.cwd(), base));
+        if (!rel || rel.startsWith('..') || path.isAbsolute(rel) || /^[a-zA-Z]:/.test(rel)) {
+            // 根目录之外的模块（如 link 的包），走 /@fs/
+            return '/@fs/' + normalizePath(base).replace(/^([a-zA-Z]):/, '/$1');
+        }
+        return '/' + rel.replace(/^\/+/, '');
+    }
+
+    function scheduleRegenerate() {
+        if (!server) return;
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(regenerate, 100);
+    }
+
+    async function extractPreproc(id) {
+        try {
+            var res = await server.transformRequest(toViteUrl(id) + '?inline');
+            if (!res || res.code == null) return [];
+            return extractor.extractColors(cssFromTransformResult(res.code));
+        } catch (e) {
+            return [];
+        }
+    }
+
+    async function regenerate() {
+        timer = null;
+        if (!server) return;
+        var arr = [];
+        for (var id of cssModules) {
+            var extracted = await extractPreproc(id);
+            if (extracted && extracted.length) arr = arr.concat(extracted);
+        }
+        // 外部 css 文件（如 cdn 引用的库 css）
+        if (opts.externalCssFiles) {
+            [].concat(opts.externalCssFiles).forEach(function (file) {
+                try { arr = arr.concat(extractor.extractColors(fs.readFileSync(file, 'utf-8'))); } catch (e) { /* ignore */ }
+            });
+        }
+        var output = dropDuplicate(arr).join('\n');
+        if (opts.resolveCss) output = opts.resolveCss(output, arr);
+        writeDevFile(output);
+    }
+
+    function writeDevFile(output) {
+        devFileName = devFileNameFor();
+        devFile = devFileFor();
+        fs.mkdirSync(path.dirname(devFile), { recursive: true });
+        fs.writeFileSync(devFile, output);
+        console.log('Extracted theme color css content length: ' + output.length);
+    }
+
+    function buildConfigJs(cfg) {
+        return '(typeof window===\'undefined\'?global:window).' + configVar + '=' + JSON.stringify(cfg) + ';';
+    }
+
+    function injectScriptTag(html, js) {
+        var tag = '<script>' + js + '</script>';
+        if (/<\/head>/i.test(html)) {
+            return html.replace(/<\/head>/i, tag + '</head>');
+        }
+        return tag + html;
+    }
+
+    return {
+        name: 'vite-theme-color-replacer',
+
+        config(config, env) {
+            isDev = env && env.command === 'serve';
+            if (!configVar) {
+                configVar = isDev ? 'tc_cfg_dev' : ('tc_cfg_' + Math.random().toString().slice(2));
+            }
+            // build 下等价于 webpack DefinePlugin；dev 下由 transformIndexHtml 注入全局变量代替
+            return {
+                define: {
+                    WP_THEME_CONFIG: JSON.stringify(configVar),
+                },
+            };
+        },
+
+        configureServer(s) {
+            server = s;
+            root = s.config.root;
+            devFileName = devFileNameFor();
+            devFile = devFileFor();
+
+            // publicDir 被禁用时，自建中间件兜底提供 dev 实体文件
+            if (!s.config.publicDir) {
+                s.middlewares.use(function (req, res, next) {
+                    if (req.url === '/' + devFileName) {
+                        try {
+                            var data = fs.readFileSync(devFile, 'utf-8');
+                            res.setHeader('Content-Type', 'text/css');
+                            res.end(data);
+                            return;
+                        } catch (e) { /* 尚未生成 */ }
+                    }
+                    next();
+                });
+            }
+        },
+
+        transform(code, id) {
+            if (!isDev || !server) return null;
+            var parts = splitId(id);
+            if (parts[1].indexOf('inline') > -1 || parts[1].indexOf('direct') > -1 || parts[1].indexOf('used') > -1) {
+                return null;
+            }
+            if (!isCssModule(id)) return null;
+            cssModules.add(parts[0]);
+            scheduleRegenerate();
+            return null;
+        },
+
+        handleHotUpdate(ctx) {
+            if (!isDev || !server) return;
+            if (isCssModule(ctx.file)) {
+                cssModules.add(splitId(ctx.file)[0]);
+                scheduleRegenerate();
+            }
+            return ctx.modules;
+        },
+
+        transformIndexHtml(html) {
+            if (isDev) {
+                // dev：把 WP_THEME_CONFIG 作为全局变量注入，供 client 的 win()[WP_THEME_CONFIG] 解析
+                var cfg = { url: '/' + (devFileName || devFileNameFor()), colors: opts.matchColors };
+                var js = 'window.WP_THEME_CONFIG=' + JSON.stringify(configVar) + ';' + buildConfigJs(cfg);
+                return injectScriptTag(html, js);
+            }
+            if (!opts.injectToHtml || !buildOutFile) return html;
+            var bcfg = { url: '/' + buildOutFile, colors: opts.matchColors };
+            if (opts.injectCss && buildOutput) bcfg.cssCode = buildOutput.replace(LINE_RE, '');
+            return injectScriptTag(html, buildConfigJs(bcfg));
+        },
+
+        generateBundle: {
+            order: 'post',
+            handler: function (options, bundle) {
+                var arr = [];
+                for (var name in bundle) {
+                    var item = bundle[name];
+                    if (item.type === 'asset' && /\.css$/i.test(name)) {
+                        arr = arr.concat(extractor.extractColors(String(item.source)));
+                    }
+                }
+                if (opts.externalCssFiles) {
+                    [].concat(opts.externalCssFiles).forEach(function (file) {
+                        try { arr = arr.concat(extractor.extractColors(fs.readFileSync(file, 'utf-8'))); } catch (e) { /* ignore */ }
+                    });
+                }
+                var output = dropDuplicate(arr).join('\n');
+                if (opts.resolveCss) output = opts.resolveCss(output, arr);
+                var outFile = replaceFileName(opts.fileName, output);
+
+                this.emitFile({ type: 'asset', fileName: outFile, source: output });
+                console.log('Extracted theme color css content length: ' + output.length);
+
+                var cfg = { url: '/' + outFile, colors: opts.matchColors };
+                if (opts.injectCss) cfg.cssCode = output.replace(LINE_RE, '');
+                var configJs = buildConfigJs(cfg);
+
+                buildOutFile = outFile;
+                buildOutput = output;
+
+                if (!opts.injectToHtml) {
+                    for (var n in bundle) {
+                        var chunk = bundle[n];
+                        if (chunk.type === 'chunk' && chunk.isEntry) {
+                            chunk.code = configJs + chunk.code;
+                        }
+                    }
+                }
+            },
+        },
+    };
+};
+
+module.exports.varyColor = varyColor;
