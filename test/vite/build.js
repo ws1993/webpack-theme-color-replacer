@@ -27,7 +27,8 @@ run().then(function (ok) {
 async function run() {
     var ok1 = await buildTest()
     var ok2 = await devTest()
-    return ok1 && ok2
+    var ok3 = await devLoopTest()
+    return ok1 && ok2 && ok3
 }
 
 async function buildTest() {
@@ -107,6 +108,49 @@ async function devTest() {
         if (devCss.indexOf('#409eff') === -1) return fail('dev css should contain compiled #409eff (scss)')
 
         console.log('dev test OK: ' + path.relative(root, devFile) + ' (' + devCss.length + ' bytes)')
+        return true
+    } finally {
+        await server.close()
+    }
+}
+
+// 回归测试：插件生成的 dev 输出文件位于被 Vite watch 的 public 目录内。
+// 若 handleHotUpdate 不忽略该文件，会形成 写文件→watch→重新生成 的死循环。
+async function devLoopTest() {
+    var p = plugin(options)
+    var server = await createServer({
+        root: root,
+        configFile: false,
+        logLevel: 'error',
+        plugins: [p],
+        server: { middlewareMode: true },
+    })
+
+    try {
+        // 触发 CSS transform（发现模块），并等待首次 regenerate 写文件
+        await server.transformRequest('/a.css')
+        await sleep(400)
+
+        var devFile = path.join(root, 'public', 'h5/css/theme-colors.css')
+        if (!fs.existsSync(devFile)) return fail('dev loop test: dev file not written: ' + devFile)
+
+        // 统计 transformRequest 调用次数：若 handleHotUpdate 误触发 regenerate，
+        // 它会再次调用 transformRequest 重新提取。
+        var calls = 0
+        var orig = server.transformRequest.bind(server)
+        server.transformRequest = async function (url) {
+            calls++
+            return orig(url)
+        }
+
+        // 模拟 Vite watcher 检测到输出文件自身变化后回调 handleHotUpdate
+        p.handleHotUpdate({ file: devFile, modules: [] })
+
+        // 超过防抖窗口后，若修复生效则不应有任何重新提取
+        await sleep(400)
+        if (calls !== 0) return fail('dev loop test: output file change triggered re-extraction (' + calls + ' calls)')
+
+        console.log('dev loop test OK: output file ignored on hot update')
         return true
     } finally {
         await server.close()

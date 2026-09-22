@@ -86,8 +86,16 @@ module.exports = function viteThemeColorReplacer(options) {
 
     function isCssModule(id) {
         var base = splitId(id)[0];
+        if (isDevOutputFile(base)) return false;
         if (exclude && exclude.test(base)) return false;
         return include.test(base);
+    }
+
+    // 插件自身生成的 dev 输出文件（如 public/h5/css/theme-colors.css）。
+    // 该文件位于被 Vite watch 的目录内，必须排除，否则会形成 写文件→watch→重新生成 的死循环。
+    function isDevOutputFile(file) {
+        if (!devFile || !file) return false;
+        return normalizePath(file) === normalizePath(devFile);
     }
 
     function devFileNameFor() {
