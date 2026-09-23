@@ -87,6 +87,8 @@ async function devTest() {
         // 触发 CSS transform（发现模块）
         await server.transformRequest('/a.css')
         await server.transformRequest('/b.scss')
+        // SFC <style> 子模块（形如 .vue?vue&type=style&index=0&lang.css）也应被识别并累积提取
+        await server.transformRequest('/d.css?vue&type=style&index=0&lang.css')
 
         // dev：Vite 跳过用户 define 的源码替换，改为在 HTML 里注入 window.WP_THEME_CONFIG 全局变量
         var html = '<!DOCTYPE html><html><head></head><body></body></html>'
@@ -106,6 +108,7 @@ async function devTest() {
         var devCss = fs.readFileSync(devFile, 'utf-8')
         if (devCss.indexOf('#f67a17') === -1) return fail('dev css should contain #f67a17')
         if (devCss.indexOf('#409eff') === -1) return fail('dev css should contain compiled #409eff (scss)')
+        if (devCss.indexOf('.sfc-style-rule') === -1) return fail('dev css should contain SFC <style> sub-module (via type=style query)')
 
         console.log('dev test OK: ' + path.relative(root, devFile) + ' (' + devCss.length + ' bytes)')
         return true

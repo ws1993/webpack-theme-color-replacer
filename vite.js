@@ -84,11 +84,35 @@ module.exports = function viteThemeColorReplacer(options) {
         return v instanceof RegExp ? v : new RegExp(v);
     }
 
+    // Vue/Svelte/Astro 等 SFC 的 <style> 子模块 id 形如 /abs/Comp.vue?vue&type=style&index=0&lang.css，
+    // base 是 .vue 等文件、不匹配 include 的 css 扩展名，但也要纳入颜色提取。
+    function isSfcStyleId(id) {
+        return /[?&]type=style(?:&|$)/.test(id);
+    }
+
+    function isSfcFile(file) {
+        return /\.(vue|svelte|astro)$/i.test(file);
+    }
+
     function isCssModule(id) {
         var base = splitId(id)[0];
         if (isDevOutputFile(base)) return false;
         if (exclude && exclude.test(base)) return false;
+        if (isSfcStyleId(id)) return true;
         return include.test(base);
+    }
+
+    // cssModules 里存的 key：普通 css 存裸路径，SFC style 子模块存完整 id（含 query，用于保留 index/lang/scoped）
+    function moduleKey(id) {
+        return isSfcStyleId(id) ? id : splitId(id)[0];
+    }
+
+    // 由 key 得到带 ?inline 的 Vite 变换 URL（query 已有时用 & 追加，否则用 ?）
+    function inlineTransformUrl(key) {
+        var q = key.indexOf('?');
+        var file = q > -1 ? key.slice(0, q) : key;
+        var query = q > -1 ? key.slice(q) : '';
+        return toViteUrl(file) + query + (query ? '&' : '?') + 'inline';
     }
 
     // 插件自身生成的 dev 输出文件（如 public/h5/css/theme-colors.css）。
@@ -127,9 +151,9 @@ module.exports = function viteThemeColorReplacer(options) {
         timer = setTimeout(regenerate, 100);
     }
 
-    async function extractPreproc(id) {
+    async function extractPreproc(key) {
         try {
-            var res = await server.transformRequest(toViteUrl(id) + '?inline');
+            var res = await server.transformRequest(inlineTransformUrl(key));
             if (!res || res.code == null) return [];
             return extractor.extractColors(cssFromTransformResult(res.code));
         } catch (e) {
@@ -141,8 +165,8 @@ module.exports = function viteThemeColorReplacer(options) {
         timer = null;
         if (!server) return;
         var arr = [];
-        for (var id of cssModules) {
-            var extracted = await extractPreproc(id);
+        for (var key of cssModules) {
+            var extracted = await extractPreproc(key);
             if (extracted && extracted.length) arr = arr.concat(extracted);
         }
         // 外部 css 文件（如 cdn 引用的库 css）
@@ -221,7 +245,7 @@ module.exports = function viteThemeColorReplacer(options) {
                 return null;
             }
             if (!isCssModule(id)) return null;
-            cssModules.add(parts[0]);
+            cssModules.add(moduleKey(id));
             scheduleRegenerate();
             return null;
         },
@@ -229,7 +253,11 @@ module.exports = function viteThemeColorReplacer(options) {
         handleHotUpdate(ctx) {
             if (!isDev || !server) return;
             if (isCssModule(ctx.file)) {
-                cssModules.add(splitId(ctx.file)[0]);
+                cssModules.add(moduleKey(ctx.file));
+                scheduleRegenerate();
+            } else if (isSfcFile(ctx.file)) {
+                // SFC 样式变化：已加载的 style 子模块会重新 transform（并重新加入 cssModules），
+                // 这里只需触发重新提取；transformRequest 每次都会重新读盘，拿到最新内容。
                 scheduleRegenerate();
             }
             return ctx.modules;
