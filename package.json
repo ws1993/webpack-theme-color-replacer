@@ -10,7 +10,7 @@
     "debug": "npm run webpack --theme_debug",
     "build-client": "node test/build-client.js",
     "test:vite": "node test/vite/build.js",
-    "prepublish": "npm run build-client && npm test"
+    "prepublishOnly": "npm run build-client && npm test && npm login --registry=https://registry.npmjs.org"
   },
   "devDependencies": {
     "css-loader": "^6.8.1",
