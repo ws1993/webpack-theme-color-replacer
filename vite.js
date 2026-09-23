@@ -107,12 +107,26 @@ module.exports = function viteThemeColorReplacer(options) {
         return isSfcStyleId(id) ? id : splitId(id)[0];
     }
 
-    // 由 key 得到带 ?inline 的 Vite 变换 URL（query 已有时用 & 追加，否则用 ?）
+    // 由 key 得到带 inline 的 Vite 变换 URL。
+    // 注意：不能简单在末尾追加 &inline。对 SFC style 子模块（...?vue&type=style&...&lang.scss），
+    // lang.scss 必须保持在查询串末尾，否则 Vite 的 CSS_LANGS_RE（/\.(css|scss|...)(?:$|\?)/）
+    // 匹配不到 lang，vite:css 就不会编译预处理，vue 插件会拿到未编译的 scss 而报错。
+    // 因此把 inline 插到 &lang.xxx 之前。
     function inlineTransformUrl(key) {
         var q = key.indexOf('?');
         var file = q > -1 ? key.slice(0, q) : key;
         var query = q > -1 ? key.slice(q) : '';
-        return toViteUrl(file) + query + (query ? '&' : '?') + 'inline';
+        if (!query) {
+            query = '?inline';
+        } else {
+            var langIdx = query.search(/&lang\.[a-z0-9]+$/i);
+            if (langIdx > -1) {
+                query = query.slice(0, langIdx) + '&inline' + query.slice(langIdx);
+            } else {
+                query = query + '&inline';
+            }
+        }
+        return toViteUrl(file) + query;
     }
 
     // 插件自身生成的 dev 输出文件（如 public/h5/css/theme-colors.css）。
